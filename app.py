@@ -62,13 +62,13 @@ if uploaded_file:
     df_act_filtered['Late'] = df_act_filtered['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
     df_act_filtered['On_Time'] = (df_act_filtered['order_status'] == 'complete') & (~df_act_filtered['Late'])
     
-    # Specific Bottlenecks
+    # Bottlenecks
     df_act_filtered['DC Delay'] = df_act_filtered['order_in_process_time'].apply(lambda x: x.time() > DC_LIMIT if pd.notnull(x) else False)
     df_act_filtered['Pick Delay'] = df_act_filtered['order_binned_time'].apply(lambda x: x.time() > PICK_LIMIT if pd.notnull(x) else False)
     df_act_filtered['CEE Late'] = df_act_filtered['assignment_to_Cee_time'].apply(lambda x: x.time() > ASGN_LIMIT if pd.notnull(x) else False)
     df_act_filtered['CEE Unavail'] = df_act_filtered['cee_id'].isnull()
     
-    # SMART BIN WAIT LOGIC (Considers 4:00 AM CEE Reporting)
+    # SMART BIN WAIT LOGIC (Starts at 4:00 AM CEE Reporting)
     df_act_filtered['four_am'] = df_act_filtered['order_binned_time'].dt.normalize() + pd.Timedelta(hours=4)
     df_act_filtered['effective_bin'] = df_act_filtered[['order_binned_time', 'four_am']].max(axis=1)
     raw_wait = (df_act_filtered['assignment_to_Cee_time'] - df_act_filtered['effective_bin']).dt.total_seconds() / 60
@@ -81,7 +81,7 @@ if uploaded_file:
         elif row['CEE Late']: return "CEE Late Reporting"
         elif row['Pick Delay']: return "Picking Delay"
         elif row['DC Delay']: return "DC Arrival Issue"
-        else: return "Last Mile / Traffic"
+        else: return "Last mile / traffic"
 
     df_act_filtered['Order_RCA'] = df_act_filtered.apply(get_order_rca, axis=1)
 
@@ -91,7 +91,7 @@ if uploaded_file:
         "CEE Late Reporting": "CEE late reporting",
         "DC Arrival Issue": "DC arrival issue",
         "CEE Unavailable": "CEE unavailable",
-        "Last Mile / Traffic": "Last mile / traffic",
+        "Last mile / traffic": "Last mile / traffic",
         "On Track": "On Track"
     }
 
@@ -139,7 +139,7 @@ if uploaded_file:
         "City Summary", "Delivery Slabs", "Store RCA", "Route Analysis", "CEE Performance", "Society Analysis", "Order Detail"
     ])
 
-    # --- TAB 1: CITY SUMMARY & CHARTS ---
+    # --- TAB 1: CITY SUMMARY ---
     with tab1:
         st.subheader(f"City Summary: {selected_city}")
         city_gross = df_filtered.groupby('city_name').agg(Total_Orders=('order_id', 'count'), Cancelled=('order_status', lambda x: (x == 'cancelled').sum())).reset_index()
@@ -164,7 +164,7 @@ if uploaded_file:
             st.markdown("**Late Orders by Store**")
             st.bar_chart(df_act_filtered.groupby('sa_name')['Late'].sum())
         with col_c2:
-            st.markdown("**Primary RCA Breakdown**")
+            st.markdown("**Primary RCA Breakdown (Late Orders)**")
             st.bar_chart(df_act_filtered[df_act_filtered['Late'] == True]['Order_RCA'].map(rca_mapping).value_counts())
 
     # --- TAB 2: DELIVERY SLABS ---
@@ -199,7 +199,6 @@ if uploaded_file:
         st_data['Late %'] = (st_data['Late_Orders'] / st_data['Actionable_Orders'] * 100).round(1).fillna(0)
         st_data['Avg Bin Wait'] = st_data['Avg_Bin_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
         
-        # Mode RCA
         late_only = df_act_filtered[df_act_filtered['Late'] == True]
         if not late_only.empty:
             store_mode = late_only.groupby('sa_name')['Order_RCA'].agg(lambda x: x.mode().iloc[0]).reset_index()
@@ -247,7 +246,10 @@ if uploaded_file:
             return " ".join(f)
         cee_data['Flags'] = cee_data.apply(cee_flags, axis=1)
         cee_data.rename(columns={'cee_name': 'CEE name', 'sa_name': 'Store'}, inplace=True)
-        st.dataframe(cee_data[['CEE name', 'Store', 'Routes', 'Orders', 'Societies', 'On-time', 'Late rate', 'First assigned', 'Last delivered', 'Flags']].sort_values('Late_Rate_Val', ascending=False), use_container_width=True)
+        
+        # FIXED: Sort the dataframe BEFORE subsetting the display columns
+        cee_display = cee_data.sort_values('Late_Rate_Val', ascending=False)
+        st.dataframe(cee_display[['CEE name', 'Store', 'Routes', 'Orders', 'Societies', 'On-time', 'Late rate', 'First assigned', 'Last delivered', 'Flags']], use_container_width=True)
 
     # --- TAB 6: SOCIETY ANALYSIS ---
     with tab6:
