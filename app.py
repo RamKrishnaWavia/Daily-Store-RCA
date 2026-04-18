@@ -23,14 +23,35 @@ if uploaded_file:
     OTD_LIMIT = pd.to_datetime('07:00:00').time()
     PICK_LIMIT = pd.to_datetime('04:00:00').time()
     ASGN_LIMIT = pd.to_datetime('06:15:00').time()
+    DC_LIMIT = pd.to_datetime('03:15:00').time()
 
-    # Base calculations
+    # Base calculations (Actionable Orders Only)
     df_act = df[df['order_status'] != 'cancelled'].copy()
     df_act['Late'] = df_act['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
-    df_act['DC Delay'] = df_act['order_in_process_time'].apply(lambda x: x.time() > pd.to_datetime('03:15:00').time() if pd.notnull(x) else False)
+    df_act['DC Delay'] = df_act['order_in_process_time'].apply(lambda x: x.time() > DC_LIMIT if pd.notnull(x) else False)
     df_act['Pick Delay'] = df_act['order_binned_time'].apply(lambda x: x.time() > PICK_LIMIT if pd.notnull(x) else False)
     df_act['CEE Late'] = df_act['assignment_to_Cee_time'].apply(lambda x: x.time() > ASGN_LIMIT if pd.notnull(x) else False)
     df_act['CEE Unavail'] = df_act['cee_id'].isnull()
+
+    # ==========================================
+    # NEW LOGIC: Order-Level RCA Hierarchy
+    # ==========================================
+    def get_order_rca(row):
+        if not row['Late']:
+            return "On Time"
+        if row['CEE Unavail']:
+            return "CEE Unavailable"
+        elif row['CEE Late']:
+            return "CEE Late Reporting"
+        elif row['Pick Delay']:
+            return "Picking Delay"
+        elif row['DC Delay']:
+            return "DC Arrival Issue"
+        else:
+            return "Last Mile / Traffic"
+
+    # Apply order-level RCA
+    df_act['Order_RCA'] = df_act.apply(get_order_rca, axis=1)
 
     # 2. Summary Cards (Top Layer)
     total_act = len(df_act)
@@ -54,20 +75,16 @@ if uploaded_file:
     else:
         df_act_filtered = df_act
 
-    # ==========================================
     # 4. TABBED VIEW NAVIGATION
-    # ==========================================
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Store RCA", 
-        "Order detail", 
-        "CEE performance", 
-        "Route analysis", 
-        "Timeline view"
+        "Store RCA", "Order detail", "CEE performance", "Route analysis", "Timeline view"
     ])
 
     # --- TAB 1: Store RCA ---
     with tab1:
         st.subheader(f"Store RCA: {selected_city}")
+        
+        # Aggregate base metrics
         store_data = df_act_filtered.groupby(['sa_name', 'city_name']).agg(
             Orders=('order_id', 'count'),
             Late_Qty=('Late', 'sum'),
@@ -77,21 +94,30 @@ if uploaded_file:
             CEE_Unavail=('CEE Unavail', 'sum'),
             Undelivered=('order_status', lambda x: (x != 'complete').sum())
         ).reset_index()
-
         store_data['Late %'] = (store_data['Late_Qty'] / store_data['Orders'] * 100).round(1)
 
-        def rca_logic(row):
-            reasons = {'DC Arrival Issue': row['DC_Delay'], 'Picking Delay': row['Pick_Delay'], 'CEE Late Report': row['CEE_Late'], 'CEE Unavail': row['CEE_Unavail']}
-            return max(reasons, key=reasons.get) if row['Late_Qty'] > 0 else "On Track"
+        # NEW LOGIC: Store-Level RCA based on mode of Late Orders
+        late_orders = df_act_filtered[df_act_filtered['Late'] == True]
+        if not late_orders.empty:
+            store_rca_mode = late_orders.groupby('sa_name')['Order_RCA'].agg(
+                lambda x: x.mode().iloc[0] if not x.empty else "On Track"
+            ).reset_index()
+            store_rca_mode.rename(columns={'Order_RCA': 'Primary RCA'}, inplace=True)
+            store_data = store_data.merge(store_rca_mode, on='sa_name', how='left')
+            store_data['Primary RCA'] = store_data['Primary RCA'].fillna("On Track")
+        else:
+            store_data['Primary RCA'] = "On Track"
 
-        store_data['Primary RCA'] = store_data.apply(rca_logic, axis=1)
-        st.dataframe(store_data, use_container_width=True)
+        # Organize columns
+        cols = ['sa_name', 'city_name', 'Orders', 'Late %', 'Primary RCA', 'Late_Qty', 'DC_Delay', 'Pick_Delay', 'CEE_Late', 'Undelivered']
+        st.dataframe(store_data[cols].sort_values(by='Late %', ascending=False), use_container_width=True)
 
     # --- TAB 2: Order Detail ---
     with tab2:
         st.subheader(f"Order Detail List: {selected_city}")
-        order_cols = ['order_id', 'sa_name', 'order_status', 'order_in_process_time', 'order_binned_time', 'assignment_to_Cee_time', 'order_delivered_time', 'Late']
-        st.dataframe(df_act_filtered[order_cols], use_container_width=True)
+        order_cols = ['order_id', 'sa_name', 'order_status', 'Order_RCA', 'order_in_process_time', 'order_binned_time', 'assignment_to_Cee_time', 'order_delivered_time']
+        # Show Late orders first
+        st.dataframe(df_act_filtered.sort_values(by='Late', ascending=False)[order_cols], use_container_width=True)
 
     # --- TAB 3: CEE Performance ---
     with tab3:
@@ -102,7 +128,6 @@ if uploaded_file:
             On_Time_Deliveries=('Late', lambda x: (~x).sum())
         ).reset_index()
         cee_data['Late %'] = (cee_data['Late_Deliveries'] / cee_data['Total_Orders'] * 100).round(1)
-        # Sort by worst performing riders
         st.dataframe(cee_data.sort_values(by='Late_Deliveries', ascending=False), use_container_width=True)
 
     # --- TAB 4: Route Analysis ---
@@ -119,7 +144,6 @@ if uploaded_file:
     with tab5:
         st.subheader("Timeline View Analytics")
         st.info("Displays delivery completion flow over time.")
-        # Simple line chart showing when orders were delivered
         delivered_df = df_act_filtered[df_act_filtered['order_status'] == 'complete'].copy()
         if not delivered_df.empty:
             delivered_df['hour_minute'] = delivered_df['order_delivered_time'].dt.strftime('%H:%M')
