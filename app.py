@@ -15,9 +15,12 @@ if uploaded_file:
     df = pd.read_csv(uploaded_file)
     
     # Pre-processing Timestamps
-    time_cols = ['slot_from_time', 'order_binned_time', 'assignment_to_Cee_time', 'order_delivered_time', 'order_in_process_time']
+    time_cols = ['slot_from_time', 'order_binned_time', 'assignment_to_Cee_time', 'dispatch_time', 'order_delivered_time', 'order_in_process_time']
     for col in time_cols:
-        df[col] = pd.to_datetime(df[col], errors='coerce')
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors='coerce')
+        else:
+            df[col] = pd.NaT # Add column if missing in report to prevent errors
 
     # --- DATE FILTER LOGIC ---
     df['delivery_date'] = df['slot_from_time'].dt.date
@@ -41,16 +44,26 @@ if uploaded_file:
     ASGN_LIMIT = pd.to_datetime('06:15:00').time()
     DC_LIMIT = pd.to_datetime('03:15:00').time()
 
+    # 3. Universal City Filter (Moved up so Top Cards reflect City choice)
+    cities = sorted(df['city_name'].dropna().unique())
+    selected_city = st.sidebar.selectbox("Select City for Analysis", ["All Cities"] + list(cities))
+
+    if selected_city != "All Cities":
+        df_filtered = df[df['city_name'] == selected_city].copy()
+    else:
+        df_filtered = df.copy()
+
     # Base calculations (Actionable Orders)
-    df_act = df[df['order_status'] != 'cancelled'].copy()
-    df_act['Late'] = df_act['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
-    df_act['DC Delay'] = df_act['order_in_process_time'].apply(lambda x: x.time() > DC_LIMIT if pd.notnull(x) else False)
-    df_act['Pick Delay'] = df_act['order_binned_time'].apply(lambda x: x.time() > PICK_LIMIT if pd.notnull(x) else False)
-    df_act['CEE Late'] = df_act['assignment_to_Cee_time'].apply(lambda x: x.time() > ASGN_LIMIT if pd.notnull(x) else False)
-    df_act['CEE Unavail'] = df_act['cee_id'].isnull()
+    df_act_filtered = df_filtered[df_filtered['order_status'] != 'cancelled'].copy()
     
-    # NEW LOGIC: Bin Waiting Time (Minutes)
-    df_act['Wait_Time_Mins'] = (df_act['assignment_to_Cee_time'] - df_act['order_binned_time']).dt.total_seconds() / 60
+    df_act_filtered['Late'] = df_act_filtered['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
+    df_act_filtered['DC Delay'] = df_act_filtered['order_in_process_time'].apply(lambda x: x.time() > DC_LIMIT if pd.notnull(x) else False)
+    df_act_filtered['Pick Delay'] = df_act_filtered['order_binned_time'].apply(lambda x: x.time() > PICK_LIMIT if pd.notnull(x) else False)
+    df_act_filtered['CEE Late'] = df_act_filtered['assignment_to_Cee_time'].apply(lambda x: x.time() > ASGN_LIMIT if pd.notnull(x) else False)
+    df_act_filtered['CEE Unavail'] = df_act_filtered['cee_id'].isnull()
+    
+    # Bin Waiting Time (Minutes)
+    df_act_filtered['Wait_Time_Mins'] = (df_act_filtered['assignment_to_Cee_time'] - df_act_filtered['order_binned_time']).dt.total_seconds() / 60
 
     # Order-Level RCA
     def get_order_rca(row):
@@ -61,7 +74,7 @@ if uploaded_file:
         elif row['DC Delay']: return "DC Arrival Issue"
         else: return "Last Mile / Traffic"
 
-    df_act['Order_RCA'] = df_act.apply(get_order_rca, axis=1)
+    df_act_filtered['Order_RCA'] = df_act_filtered.apply(get_order_rca, axis=1)
 
     # RCA Label Mapping
     rca_mapping = {
@@ -73,31 +86,49 @@ if uploaded_file:
         "On Track": "On Track"
     }
 
-    # 2. Summary Cards (Top Layer)
-    total_act = len(df_act)
-    on_time = (df_act['order_status'] == 'complete') & (~df_act['Late'])
+    # --- STATUS CLASSIFIER FOR TILE CARDS ---
+    def classify_status(row):
+        status = str(row['order_status']).lower()
+        if status == 'cancelled': return 'Cancelled'
+        if status in ['complete', 'delivered']: return 'Delivered'
+        if status in ['ofd', 'dispatched']: return 'OFD'
+        if status in ['binned', 'packed']: return 'Bin'
+        
+        # Fallback logic based on timestamps if status is vaguely 'open' or 'processing'
+        if pd.notnull(row['order_delivered_time']): return 'Delivered'
+        if pd.notnull(row['dispatch_time']): return 'OFD'
+        if pd.notnull(row['order_binned_time']): return 'Bin'
+        return 'Open'
+
+    df_filtered['Live_Status'] = df_filtered.apply(classify_status, axis=1)
+
+    # ==========================================
+    # NEW DASHBOARD HEADER (TILE CARDS)
+    # ==========================================
+    total_act = len(df_act_filtered)
+    on_time = (df_act_filtered['order_status'] == 'complete') & (~df_act_filtered['Late'])
     otd_pct = (on_time.sum() / total_act) * 100 if total_act > 0 else 0
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Actionable Orders", f"{total_act:,}")
-    col2.metric("On-Time Rate", f"{otd_pct:.1f}%")
-    col3.metric("Late Orders", f"{df_act['Late'].sum():,}")
-    col4.metric("Cancelled Orders", f"{(df['order_status'] == 'cancelled').sum():,}")
+    st.markdown(f"### 📊 Operational Overview: {selected_city}")
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Actionable Orders", f"{total_act:,}")
+    c2.metric("On-Time Rate", f"{otd_pct:.1f}%")
+    c3.metric("Late Orders", f"{df_act_filtered['Late'].sum():,}")
+    c4.metric("Total Routes", f"{df_filtered['route_id'].nunique():,}")
+    c5.metric("Total CEEs", f"{df_filtered['cee_id'].nunique():,}")
+    c6.metric("Total Societies", f"{df_filtered['society_id'].nunique():,}")
+
+    st.markdown("### 📦 Live Order Pipeline")
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("📝 Open", f"{(df_filtered['Live_Status'] == 'Open').sum():,}")
+    s2.metric("🛒 Bin", f"{(df_filtered['Live_Status'] == 'Bin').sum():,}")
+    s3.metric("🛵 OFD", f"{(df_filtered['Live_Status'] == 'OFD').sum():,}")
+    s4.metric("✅ Delivered", f"{(df_filtered['Live_Status'] == 'Delivered').sum():,}")
+    s5.metric("❌ Cancelled", f"{(df_filtered['Live_Status'] == 'Cancelled').sum():,}")
 
     st.divider()
 
-    # 3. Universal City Filter
-    cities = sorted(df['city_name'].dropna().unique())
-    selected_city = st.selectbox("Select City for Analysis", ["All Cities"] + list(cities))
-
-    if selected_city != "All Cities":
-        df_filtered = df[df['city_name'] == selected_city]
-        df_act_filtered = df_act[df_act['city_name'] == selected_city]
-    else:
-        df_filtered = df
-        df_act_filtered = df_act
-
-    # 4. TABBED VIEW NAVIGATION (Timeline removed)
+    # 4. TABBED VIEW NAVIGATION
     tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "City Charts (Visuals)", "Store RCA", "Route Analysis", "CEE Performance", "Society Analysis", "Order Detail"
     ])
@@ -126,28 +157,25 @@ if uploaded_file:
     with tab2:
         st.subheader(f"Store RCA: {selected_city}")
         
-        # Gross metrics (including cancelled)
         store_gross = df_filtered.groupby('sa_name').agg(
             Total_Orders=('order_id', 'count'),
             Cancelled=('order_status', lambda x: (x == 'cancelled').sum()),
             Total_Societies=('society_id', 'nunique')
         ).reset_index()
 
-        # Actionable metrics
         store_act = df_act_filtered.groupby('sa_name').agg(
             Actionable_Orders=('order_id', 'count'),
             Late_Orders=('Late', 'sum'),
             DC_Delay=('DC Delay', 'sum'),
             Pick_Delay=('Pick Delay', 'sum'),
             CEE_Late=('CEE Late', 'sum'),
-            Avg_Bin_Wait=('Wait_Time_Mins', 'mean')  # <--- Added Wait Time
+            Avg_Bin_Wait=('Wait_Time_Mins', 'mean')
         ).reset_index()
 
         store_data = store_gross.merge(store_act, on='sa_name', how='left').fillna(0)
         store_data['Late %'] = (store_data['Late_Orders'] / store_data['Actionable_Orders'] * 100).round(1).fillna(0)
         store_data['Avg Bin Wait'] = store_data['Avg_Bin_Wait'].apply(lambda x: f"{int(x)}m" if pd.notnull(x) and x != 0 else "-")
 
-        # RCA Logic
         late_orders = df_act_filtered[df_act_filtered['Late'] == True]
         if not late_orders.empty:
             store_rca_mode = late_orders.groupby('sa_name')['Order_RCA'].agg(lambda x: x.mode().iloc[0]).reset_index()
@@ -172,7 +200,7 @@ if uploaded_file:
             Late_Orders=('Late', 'sum'),
             First_Binned_Time=('order_binned_time', 'min'),
             Last_Delivery_Time=('order_delivered_time', 'max'),
-            Avg_Bin_Wait=('Wait_Time_Mins', 'mean') # <--- Added Wait Time
+            Avg_Bin_Wait=('Wait_Time_Mins', 'mean')
         ).reset_index()
 
         route_data['Late_Rate_Num'] = (route_data['Late_Orders'] / route_data['Orders']) * 100
@@ -307,7 +335,7 @@ if uploaded_file:
 
         order_data['RCA'] = order_data.apply(get_detailed_order_rca, axis=1)
         
-        order_data.rename(columns={'order_id': 'Order ID', 'sa_name': 'Store', 'order_status': 'Status'}, inplace=True)
+        order_data.rename(columns={'order_id': 'Order ID', 'sa_name': 'Store', 'Live_Status': 'Status'}, inplace=True)
         order_cols = ['Order ID', 'Store', 'CEE Name', 'Route', 'Status', 'Binned', 'Assigned', 'Delivered', 'Bin→Assign', 'Assign→Deliver', 'RCA']
         
         st.dataframe(order_data[order_cols], use_container_width=True)
