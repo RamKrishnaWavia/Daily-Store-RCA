@@ -60,10 +60,8 @@ if uploaded_file:
     df_filtered['Live_Status'] = df_filtered.apply(classify_status, axis=1)
 
     # --- CORE LOGIC CALCULATIONS ---
-    # Actionable dataset (excluding all types of cancellations)
     df_act = df_filtered[df_filtered['Live_Status'] != 'Cancelled'].copy()
     
-    # Constants
     OTD_LIMIT = datetime.time(7, 0)
     PICK_LIMIT = datetime.time(4, 0)
 
@@ -81,28 +79,23 @@ if uploaded_file:
     ).reset_index().rename(columns={'order_binned_time': 'is_dc_late_store'})
     df_act = df_act.merge(store_bin_stats, on='sa_name', how='left')
 
-    # 4. Late & On-Time Flags (OTD > 7 AM)
+    # 4. Late & On-Time Flags
     df_act['Late'] = df_act['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
     df_act['On_Time'] = (df_act['Live_Status'] == 'Delivered') & (~df_act['Late'])
 
     # 5. PRIMARY RCA LOGIC
     def calculate_rca(row):
         no_route = pd.isnull(row['route_id']) or row['route_id'] == 0
-        # CEE Unavailable
         if pd.notnull(row['order_binned_time']) and no_route and row['Effective_Wait_Mins'] > 30:
             return "CEE Unavailable"
-        # CEE Late Reporting
         if pd.notnull(row['assignment_to_Cee_time']) and row['assignment_to_Cee_time'].time() > datetime.time(4, 30):
             return "CEE Late Reporting"
-        # Picking Delay
         delayed_picking_flag = str(row.get('Delayed_picking', 'no')).lower() == 'yes'
         if row['order_binned_time'].time() > PICK_LIMIT:
             if not row['is_dc_late_store'] or delayed_picking_flag:
                 return "GRN / Picking Delay"
-        # DC Arrival Issue
         if row['is_dc_late_store']:
             return "DC Arrival Issue"
-        # CEE Travel Time
         if row['Travel_Mins'] > 120:
             return "CEE Took More Time"
         return "Last Mile / Traffic"
@@ -125,44 +118,30 @@ if uploaded_file:
         "City Summary", "Delivery Slabs", "Store RCA", "Route Analysis", "CEE Performance", "Society Analysis", "Order Detail"
     ])
 
-    with tab1: # City Summary (Updated with RCA Table)
+    with tab1: # City Summary
         st.subheader("Late Delivery RCA Summary (OTD > 7:00 AM)")
         late_orders = df_act[df_act['Late'] == True]
-        
         if not late_orders.empty:
-            # Aggregate RCA Counts
+            # FIXED: Column naming consistency
             rca_summary = late_orders['Primary_RCA'].value_counts().reset_index()
-            rca_summary.columns = ['Root Cause', 'Order Count']
+            rca_summary.columns = ['Root Cause', 'Order_Count']
             rca_summary['Contribution %'] = (rca_summary['Order_Count'] / rca_summary['Order_Count'].sum() * 100).round(1).astype(str) + '%'
             
             sc1, sc2 = st.columns([1, 1])
-            with sc1:
-                st.dataframe(rca_summary, width='stretch')
-            with sc2:
-                st.bar_chart(rca_summary.set_index('Root Cause')['Order Count'])
-        else:
-            st.success("🎉 No late orders found for the selected filters!")
-
+            with sc1: st.dataframe(rca_summary, width='stretch')
+            with sc2: st.bar_chart(rca_summary.set_index('Root Cause')['Order_Count'])
+        
         st.divider()
-        st.subheader("City-Wise Status & Performance")
-        city_summary = df_act.groupby('city_name').agg(
-            Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Avg_Bin_Wait=('Effective_Wait_Mins', 'mean')
-        ).reset_index()
-
+        city_summary = df_act.groupby('city_name').agg(Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Avg_Bin_Wait=('Effective_Wait_Mins', 'mean')).reset_index()
         status_pivot = df_filtered.pivot_table(index='city_name', columns='Live_Status', values='order_id', aggfunc='count', fill_value=0).reset_index()
         for col in ['Open', 'Bin', 'OFD', 'Delivered', 'Cancelled']:
             if col not in status_pivot.columns: status_pivot[col] = 0
-        
         city_final = city_summary.merge(status_pivot, on='city_name', how='left')
         city_final['Late %'] = (city_final['Late'] / city_final['Orders'] * 100).round(1)
         city_final['Avg Bin Wait'] = city_final['Avg_Bin_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
-        city_final.rename(columns={'city_name': 'City'}, inplace=True)
-        
-        cols = ['City', 'Orders', 'Open', 'Bin', 'OFD', 'Delivered', 'Cancelled', 'On_Time', 'Late', 'Late %', 'Avg Bin Wait']
-        st.dataframe(city_final[cols].sort_values('Late %', ascending=False), width='stretch')
+        st.dataframe(city_final[['city_name', 'Orders', 'Open', 'Bin', 'OFD', 'Delivered', 'Cancelled', 'On_Time', 'Late', 'Late %', 'Avg Bin Wait']], width='stretch')
 
     with tab2: # Delivery Slabs
-        st.subheader("Delivery Timing Breakdown")
         def get_slab(t):
             if pd.isnull(t): return "Undelivered"
             t = t.time()
@@ -178,22 +157,12 @@ if uploaded_file:
         st.bar_chart(slab_view.set_index('Slab')['Orders'])
 
     with tab3: # Store RCA
-        st.subheader("Store Performance & RCA Breakdown")
-        store_base = df_act.groupby('sa_name').agg(
-            Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Societies=('society_id', 'nunique'), Avg_Wait=('Effective_Wait_Mins', 'mean')
-        ).reset_index()
-
-        rca_pivot = df_act[df_act['Late'] == True].pivot_table(
-            index='sa_name', columns='Primary_RCA', values='order_id', aggfunc='count', fill_value=0
-        ).reset_index()
-
+        store_base = df_act.groupby('sa_name').agg(Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Societies=('society_id', 'nunique'), Avg_Wait=('Effective_Wait_Mins', 'mean')).reset_index()
+        rca_pivot = df_act[df_act['Late'] == True].pivot_table(index='sa_name', columns='Primary_RCA', values='order_id', aggfunc='count', fill_value=0).reset_index()
         store_final = store_base.merge(rca_pivot, on='sa_name', how='left').fillna(0)
         store_final['Late %'] = (store_final['Late'] / store_final['Orders'] * 100).round(1)
         store_final['Avg Bin Wait'] = store_final['Avg_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
-        
-        base_cols = ['sa_name', 'Orders', 'On_Time', 'Late', 'Late %', 'Societies', 'Avg Bin Wait']
-        rca_cols = [c for c in rca_pivot.columns if c != 'sa_name']
-        st.dataframe(store_final[base_cols + rca_cols].sort_values('Late %', ascending=False), width='stretch')
+        st.dataframe(store_final.sort_values('Late %', ascending=False), width='stretch')
 
     with tab4: # Route Analysis
         rt_view = df_act.groupby(['route_id', 'sa_name']).agg(Orders=('order_id', 'count'), Late=('Late', 'sum'), Societies=('society_id', 'nunique'), Avg_Wait=('Effective_Wait_Mins', 'mean'), Travel=('Travel_Mins', 'mean'), Route_Weight=('order_weight', 'sum' if 'order_weight' in df_act.columns else 'count')).reset_index()
@@ -210,14 +179,23 @@ if uploaded_file:
         rt_view['Weight'] = rt_view['Route_Weight'].apply(lambda x: f"{x:.1f}kg")
         st.dataframe(rt_view[['route_id', 'sa_name', 'Orders', 'Weight', 'Late Rate', 'Societies', 'Avg Bin Wait', 'Avg Travel']].sort_values('Orders', ascending=False), width='stretch')
 
-    with tab5: # CEE Performance
-        cee_base = df_act.groupby(['cee_name', 'cee_id', 'sa_name']).agg(Trips=('route_id', 'nunique'), Orders=('order_id', 'count'), Societies=('society_id', 'nunique'), Late=('Late', 'sum'), First_Asg=('assignment_to_Cee_time', 'min')).reset_index()
-        trip_dist = cee_base['Trips'].value_counts().sort_index().reset_index()
-        trip_dist.columns = ['Trips Completed', 'No. of CEEs']
-        col_dist1, col_dist2 = st.columns([1, 2])
-        with col_dist1: st.dataframe(trip_dist, width='stretch')
-        with col_dist2: st.bar_chart(trip_dist.set_index('Trips Completed'))
-        st.divider()
+    with tab5: # CEE PERFORMANCE
+        st.subheader(f"CEE Performance Details: {selected_city}")
+        cee_base = df_act.groupby(['cee_name', 'cee_id', 'sa_name']).agg(
+            Trips=('route_id', 'nunique'),
+            Orders=('order_id', 'count'),
+            Societies=('society_id', 'nunique'),
+            Late=('Late', 'sum'),
+            First_Route_Asg=('assignment_to_Cee_time', 'min'),
+            Last_Route_Asg=('assignment_to_Cee_time', 'max'),
+            First_Route_Del=('order_delivered_time', 'min'),
+            Last_Route_Del=('order_delivered_time', 'max')
+        ).reset_index()
+        cee_base['First route assignment'] = cee_base['First_Route_Asg'].dt.strftime('%H:%M').fillna('-')
+        cee_base['Last route assignment'] = cee_base['Last_Route_Asg'].dt.strftime('%H:%M').fillna('-')
+        cee_base['First route delivery time'] = cee_base['First_Route_Del'].dt.strftime('%H:%M').fillna('-')
+        cee_base['Last route route delivery time'] = cee_base['Last_Route_Del'].dt.strftime('%H:%M').fillna('-')
+        
         def get_cee_slab(t):
             if pd.isnull(t): return "-"
             tm = t.time()
@@ -226,9 +204,10 @@ if uploaded_file:
             elif tm >= datetime.time(5, 0): return "> 05:00 AM"
             elif tm >= datetime.time(4, 30): return "> 04:30 AM"
             return "On-Time Start"
-        cee_base['Reporting Slab'] = cee_base['First_Asg'].apply(get_cee_slab)
+        cee_base['Reporting Slab'] = cee_base['First_Route_Asg'].apply(get_cee_slab)
         cee_base['Late Rate %'] = (cee_base['Late'] / cee_base['Orders'] * 100).round(1)
-        st.dataframe(cee_base[['cee_name', 'sa_name', 'Trips', 'Orders', 'Societies', 'Reporting Slab', 'Late Rate %']].sort_values('Trips', ascending=False), width='stretch')
+        cee_cols = ['cee_name', 'sa_name', 'Trips', 'Orders', 'Societies', 'First route assignment', 'Last route assignment', 'First route delivery time', 'Last route route delivery time', 'Reporting Slab', 'Late Rate %']
+        st.dataframe(cee_base[cee_cols].sort_values('Trips', ascending=False), width='stretch')
 
     with tab6: # Society Analysis
         soc_view = df_act.groupby(['society_id', 'sa_name']).agg(Orders=('order_id', 'count'), Routes=('route_id', 'nunique'), CEEs=('cee_id', 'nunique'), Late=('Late', 'sum')).reset_index()
@@ -243,4 +222,4 @@ if uploaded_file:
         st.dataframe(od[od_cols], width='stretch')
 
 else:
-    st.info("Please upload the Delivery Report CSV in the sidebar.")
+    st.info("Upload the CSV to begin.")
