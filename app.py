@@ -44,7 +44,7 @@ if uploaded_file:
         st.warning("No data available for the selected filters.")
         st.stop()
 
-    # --- UPDATED: STATUS CLASSIFIER ---
+    # --- STATUS CLASSIFIER (Based on User Rules) ---
     def classify_status(row):
         status = str(row['order_status']).lower()
         if status in ['cancelled', 'payment_pending']: 
@@ -60,7 +60,7 @@ if uploaded_file:
     df_filtered['Live_Status'] = df_filtered.apply(classify_status, axis=1)
 
     # --- CORE LOGIC CALCULATIONS ---
-    # Actionable dataset (excluding all types of cancellations per new rules)
+    # Actionable dataset (excluding all types of cancellations)
     df_act = df_filtered[df_filtered['Live_Status'] != 'Cancelled'].copy()
     
     # Constants
@@ -81,23 +81,28 @@ if uploaded_file:
     ).reset_index().rename(columns={'order_binned_time': 'is_dc_late_store'})
     df_act = df_act.merge(store_bin_stats, on='sa_name', how='left')
 
-    # 4. Late & On-Time Flags
+    # 4. Late & On-Time Flags (OTD > 7 AM)
     df_act['Late'] = df_act['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
     df_act['On_Time'] = (df_act['Live_Status'] == 'Delivered') & (~df_act['Late'])
 
     # 5. PRIMARY RCA LOGIC
     def calculate_rca(row):
         no_route = pd.isnull(row['route_id']) or row['route_id'] == 0
+        # CEE Unavailable
         if pd.notnull(row['order_binned_time']) and no_route and row['Effective_Wait_Mins'] > 30:
             return "CEE Unavailable"
+        # CEE Late Reporting
         if pd.notnull(row['assignment_to_Cee_time']) and row['assignment_to_Cee_time'].time() > datetime.time(4, 30):
             return "CEE Late Reporting"
+        # Picking Delay
         delayed_picking_flag = str(row.get('Delayed_picking', 'no')).lower() == 'yes'
         if row['order_binned_time'].time() > PICK_LIMIT:
             if not row['is_dc_late_store'] or delayed_picking_flag:
                 return "GRN / Picking Delay"
+        # DC Arrival Issue
         if row['is_dc_late_store']:
             return "DC Arrival Issue"
+        # CEE Travel Time
         if row['Travel_Mins'] > 120:
             return "CEE Took More Time"
         return "Last Mile / Traffic"
@@ -120,18 +125,44 @@ if uploaded_file:
         "City Summary", "Delivery Slabs", "Store RCA", "Route Analysis", "CEE Performance", "Society Analysis", "Order Detail"
     ])
 
-    with tab1: # City Summary
-        city_summary = df_act.groupby('city_name').agg(Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Avg_Bin_Wait=('Effective_Wait_Mins', 'mean')).reset_index()
+    with tab1: # City Summary (Updated with RCA Table)
+        st.subheader("Late Delivery RCA Summary (OTD > 7:00 AM)")
+        late_orders = df_act[df_act['Late'] == True]
+        
+        if not late_orders.empty:
+            # Aggregate RCA Counts
+            rca_summary = late_orders['Primary_RCA'].value_counts().reset_index()
+            rca_summary.columns = ['Root Cause', 'Order Count']
+            rca_summary['Contribution %'] = (rca_summary['Order_Count'] / rca_summary['Order_Count'].sum() * 100).round(1).astype(str) + '%'
+            
+            sc1, sc2 = st.columns([1, 1])
+            with sc1:
+                st.dataframe(rca_summary, width='stretch')
+            with sc2:
+                st.bar_chart(rca_summary.set_index('Root Cause')['Order Count'])
+        else:
+            st.success("🎉 No late orders found for the selected filters!")
+
+        st.divider()
+        st.subheader("City-Wise Status & Performance")
+        city_summary = df_act.groupby('city_name').agg(
+            Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Avg_Bin_Wait=('Effective_Wait_Mins', 'mean')
+        ).reset_index()
+
         status_pivot = df_filtered.pivot_table(index='city_name', columns='Live_Status', values='order_id', aggfunc='count', fill_value=0).reset_index()
         for col in ['Open', 'Bin', 'OFD', 'Delivered', 'Cancelled']:
             if col not in status_pivot.columns: status_pivot[col] = 0
+        
         city_final = city_summary.merge(status_pivot, on='city_name', how='left')
         city_final['Late %'] = (city_final['Late'] / city_final['Orders'] * 100).round(1)
         city_final['Avg Bin Wait'] = city_final['Avg_Bin_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
-        st.dataframe(city_final[['city_name', 'Orders', 'Open', 'Bin', 'OFD', 'Delivered', 'Cancelled', 'On_Time', 'Late', 'Late %', 'Avg Bin Wait']], width='stretch')
-        st.bar_chart(df_act[df_act['Late'] == True]['Primary_RCA'].value_counts())
+        city_final.rename(columns={'city_name': 'City'}, inplace=True)
+        
+        cols = ['City', 'Orders', 'Open', 'Bin', 'OFD', 'Delivered', 'Cancelled', 'On_Time', 'Late', 'Late %', 'Avg Bin Wait']
+        st.dataframe(city_final[cols].sort_values('Late %', ascending=False), width='stretch')
 
     with tab2: # Delivery Slabs
+        st.subheader("Delivery Timing Breakdown")
         def get_slab(t):
             if pd.isnull(t): return "Undelivered"
             t = t.time()
@@ -144,8 +175,9 @@ if uploaded_file:
         df_act['Slab'] = df_act['order_delivered_time'].apply(get_slab)
         slab_view = df_act[df_act['Slab'] != "Undelivered"].groupby('Slab').agg(Orders=('order_id', 'count'), Stores=('sa_name', 'nunique'), Societies=('society_id', 'nunique')).reset_index()
         st.dataframe(slab_view, width='stretch')
+        st.bar_chart(slab_view.set_index('Slab')['Orders'])
 
-    with tab3: # STORE RCA (Updated with RCA Wise Summary)
+    with tab3: # Store RCA
         st.subheader("Store Performance & RCA Breakdown")
         store_base = df_act.groupby('sa_name').agg(
             Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Societies=('society_id', 'nunique'), Avg_Wait=('Effective_Wait_Mins', 'mean')
@@ -159,7 +191,6 @@ if uploaded_file:
         store_final['Late %'] = (store_final['Late'] / store_final['Orders'] * 100).round(1)
         store_final['Avg Bin Wait'] = store_final['Avg_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
         
-        # Build dynamic column list
         base_cols = ['sa_name', 'Orders', 'On_Time', 'Late', 'Late %', 'Societies', 'Avg Bin Wait']
         rca_cols = [c for c in rca_pivot.columns if c != 'sa_name']
         st.dataframe(store_final[base_cols + rca_cols].sort_values('Late %', ascending=False), width='stretch')
@@ -212,4 +243,4 @@ if uploaded_file:
         st.dataframe(od[od_cols], width='stretch')
 
 else:
-    st.info("Please upload the Delivery Report CSV to begin.")
+    st.info("Please upload the Delivery Report CSV in the sidebar.")
