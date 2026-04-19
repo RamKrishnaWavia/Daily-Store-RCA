@@ -73,16 +73,21 @@ if uploaded_file:
     # PRIMARY RCA LOGIC
     def calculate_rca(row):
         no_route = pd.isnull(row['route_id']) or row['route_id'] == 0
+        # CEE Unavailable: Binned + No Route + Wait > 30 mins after 4 AM
         if pd.notnull(row['order_binned_time']) and no_route and row['Effective_Wait_Mins'] > 30:
             return "CEE Unavailable"
+        # CEE Late Reporting: Assignment after 4:30 AM
         if pd.notnull(row['assignment_to_Cee_time']) and row['assignment_to_Cee_time'].time() > datetime.time(4, 30):
             return "CEE Late Reporting"
+        # Picking Delay: Manual flag OR Binned after 4 AM (and store isn't DC Late)
         delayed_picking_flag = str(row.get('Delayed_picking', 'no')).lower() == 'yes'
         if row['order_binned_time'].time() > PICK_LIMIT:
             if not row['is_dc_late_store'] or delayed_picking_flag:
                 return "GRN / Picking Delay"
+        # DC Arrival: Bulk failure
         if row['is_dc_late_store']:
             return "DC Arrival Issue"
+        # CEE Speed
         if row['Travel_Mins'] > 120:
             return "CEE Took More Time"
         return "Last Mile / Traffic"
@@ -141,33 +146,21 @@ if uploaded_file:
         st_data['Primary_RCA'] = st_data['Primary_RCA'].fillna("On Track")
         st.dataframe(st_data[['sa_name', 'Total_Orders', 'Actionable_Orders', 'On_Time_Orders', 'Late %', 'Primary_RCA', 'Avg Bin Wait']].sort_values('Late %', ascending=False), width='stretch')
 
-    with tab4: # ROUTE ANALYSIS (Updated with Weight Stats)
+    with tab4: # ROUTE ANALYSIS
         st.subheader(f"Route Level Performance: {selected_city}")
         
-        # Check if weight column exists (using 'total_weight' as default)
-        weight_col = 'total_weight' if 'total_weight' in df_act.columns else None
+        # Consider 'order_weight' column
+        weight_col = 'order_weight'
         
-        # Base Route Data
-        rt_agg = {
-            'order_id': 'count', 
-            'Late': 'sum', 
-            'society_id': 'nunique', 
-            'Effective_Wait_Mins': 'mean', 
-            'Travel_Mins': 'mean'
-        }
-        if weight_col:
-            rt_agg[weight_col] = 'sum'
+        rt_view = df_act.groupby(['route_id', 'sa_name']).agg(
+            Orders=('order_id', 'count'), 
+            Late=('Late', 'sum'), 
+            Societies=('society_id', 'nunique'), 
+            Avg_Wait=('Effective_Wait_Mins', 'mean'), 
+            Travel=('Travel_Mins', 'mean'),
+            Route_Weight=(weight_col if weight_col in df_act.columns else 'order_id', 'sum' if weight_col in df_act.columns else 'count')
+        ).reset_index()
 
-        rt_view = df_act.groupby(['route_id', 'sa_name']).agg(**{
-            'Orders': ('order_id', 'count'),
-            'Late': ('Late', 'sum'),
-            'Societies': ('society_id', 'nunique'),
-            'Avg_Wait': ('Effective_Wait_Mins', 'mean'),
-            'Travel': ('Travel_Mins', 'mean'),
-            'Total_Weight': (weight_col if weight_col else 'order_id', 'sum' if weight_col else 'count')
-        }).reset_index()
-
-        # 1. Summary Statistics for Routes
         st.markdown("**Route Productivity Stats**")
         rs1, rs2 = st.columns(2)
         rs3, rs4 = st.columns(2)
@@ -176,23 +169,21 @@ if uploaded_file:
         rs2.write(f"🏘️ **Societies per Route:** Min: {int(rt_view['Societies'].min())} | Max: {int(rt_view['Societies'].max())} | Avg: {rt_view['Societies'].mean():.1f}")
         rs3.write(f"⏱️ **Avg Travel per Route:** {int(rt_view['Travel'].mean())}m")
         
-        if weight_col:
-            rs4.write(f"⚖️ **Weight per Route:** Min: {rt_view['Total_Weight'].min():.1f}kg | Max: {rt_view['Total_Weight'].max():.1f}kg | Avg: {rt_view['Total_Weight'].mean():.1f}kg")
+        if weight_col in df_act.columns:
+            rs4.write(f"⚖️ **Weight per Route:** Min: {rt_view['Route_Weight'].min():.1f}kg | Max: {rt_view['Route_Weight'].max():.1f}kg | Avg: {rt_view['Route_Weight'].mean():.1f}kg")
         else:
-            rs4.info("Weight column not found in CSV.")
+            rs4.info("Column 'order_weight' not found.")
         
         st.divider()
 
-        # 2. Detailed Table
         rt_view['Late Rate'] = (rt_view['Late'] / rt_view['Orders'] * 100).round(0).astype(int).astype(str) + '%'
         rt_view['Avg Bin Wait'] = rt_view['Avg_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
         rt_view['Avg Travel'] = rt_view['Travel'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
-        rt_view['Weight'] = rt_view['Total_Weight'].apply(lambda x: f"{x:.1f}kg")
+        rt_view['Weight'] = rt_view['Route_Weight'].apply(lambda x: f"{x:.1f}kg")
         
         st.dataframe(rt_view[['route_id', 'sa_name', 'Orders', 'Weight', 'Late Rate', 'Societies', 'Avg Bin Wait', 'Avg Travel']].sort_values('Orders', ascending=False), width='stretch')
 
     with tab5: # CEE Performance
-        st.subheader(f"CEE Trip Distribution Summary: {selected_city}")
         cee_base = df_act.groupby(['cee_name', 'cee_id', 'sa_name']).agg(Trips=('route_id', 'nunique'), Orders=('order_id', 'count'), Societies=('society_id', 'nunique'), Late=('Late', 'sum'), First_Asg=('assignment_to_Cee_time', 'min')).reset_index()
         trip_dist = cee_base['Trips'].value_counts().sort_index().reset_index()
         trip_dist.columns = ['Trips Completed', 'No. of CEEs']
