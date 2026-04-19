@@ -44,7 +44,7 @@ if uploaded_file:
         st.warning("No data available for the selected filters.")
         st.stop()
 
-    # --- STATUS CLASSIFIER (Based on User Rules) ---
+    # --- STATUS CLASSIFIER ---
     def classify_status(row):
         status = str(row['order_status']).lower()
         if status in ['cancelled', 'payment_pending']: 
@@ -122,15 +122,12 @@ if uploaded_file:
         st.subheader("Late Delivery RCA Summary (OTD > 7:00 AM)")
         late_orders = df_act[df_act['Late'] == True]
         if not late_orders.empty:
-            # FIXED: Column naming consistency
             rca_summary = late_orders['Primary_RCA'].value_counts().reset_index()
             rca_summary.columns = ['Root Cause', 'Order_Count']
             rca_summary['Contribution %'] = (rca_summary['Order_Count'] / rca_summary['Order_Count'].sum() * 100).round(1).astype(str) + '%'
-            
             sc1, sc2 = st.columns([1, 1])
             with sc1: st.dataframe(rca_summary, width='stretch')
             with sc2: st.bar_chart(rca_summary.set_index('Root Cause')['Order_Count'])
-        
         st.divider()
         city_summary = df_act.groupby('city_name').agg(Orders=('order_id', 'count'), On_Time=('On_Time', 'sum'), Late=('Late', 'sum'), Avg_Bin_Wait=('Effective_Wait_Mins', 'mean')).reset_index()
         status_pivot = df_filtered.pivot_table(index='city_name', columns='Live_Status', values='order_id', aggfunc='count', fill_value=0).reset_index()
@@ -179,9 +176,11 @@ if uploaded_file:
         rt_view['Weight'] = rt_view['Route_Weight'].apply(lambda x: f"{x:.1f}kg")
         st.dataframe(rt_view[['route_id', 'sa_name', 'Orders', 'Weight', 'Late Rate', 'Societies', 'Avg Bin Wait', 'Avg Travel']].sort_values('Orders', ascending=False), width='stretch')
 
-    with tab5: # CEE PERFORMANCE
-        st.subheader(f"CEE Performance Details: {selected_city}")
-        cee_base = df_act.groupby(['cee_name', 'cee_id', 'sa_name']).agg(
+    with tab5: # CEE PERFORMANCE (Efficiency & Slab Summary Added)
+        st.subheader(f"CEE Performance & Efficiency Summary")
+        
+        # 1. Base CEE Metrics Calculation
+        cee_base = df_act.groupby(['city_name', 'sa_name', 'cee_name', 'cee_id']).agg(
             Trips=('route_id', 'nunique'),
             Orders=('order_id', 'count'),
             Societies=('society_id', 'nunique'),
@@ -189,13 +188,22 @@ if uploaded_file:
             First_Route_Asg=('assignment_to_Cee_time', 'min'),
             Last_Route_Asg=('assignment_to_Cee_time', 'max'),
             First_Route_Del=('order_delivered_time', 'min'),
-            Last_Route_Del=('order_delivered_time', 'max')
+            Last_Route_Del=('order_delivered_time', 'max'),
+            Avg_Travel_Time=('Travel_Mins', 'mean')
         ).reset_index()
-        cee_base['First route assignment'] = cee_base['First_Route_Asg'].dt.strftime('%H:%M').fillna('-')
-        cee_base['Last route assignment'] = cee_base['Last_Route_Asg'].dt.strftime('%H:%M').fillna('-')
-        cee_base['First route delivery time'] = cee_base['First_Route_Del'].dt.strftime('%H:%M').fillna('-')
-        cee_base['Last route route delivery time'] = cee_base['Last_Route_Del'].dt.strftime('%H:%M').fillna('-')
-        
+
+        # Efficiency Stats row
+        eff1, eff2, eff3, eff4 = st.columns(4)
+        multi_trippers = (cee_base['Trips'] > 1).sum()
+        total_cees = len(cee_base)
+        eff1.metric("Multi-Tripping %", f"{(multi_trippers/total_cees*100):.1f}%")
+        eff2.metric("Avg Orders/Trip", f"{(cee_base['Orders'].sum()/cee_base['Trips'].sum()):.1f}")
+        eff3.metric("Avg Societies/Trip", f"{(cee_base['Societies'].sum()/cee_base['Trips'].sum()):.1f}")
+        eff4.metric("Avg CEE Travel Time", f"{int(cee_base['Avg_Travel_Time'].mean())}m")
+
+        st.divider()
+
+        # 2. Reporting Slab Analysis
         def get_cee_slab(t):
             if pd.isnull(t): return "-"
             tm = t.time()
@@ -204,10 +212,42 @@ if uploaded_file:
             elif tm >= datetime.time(5, 0): return "> 05:00 AM"
             elif tm >= datetime.time(4, 30): return "> 04:30 AM"
             return "On-Time Start"
+        
         cee_base['Reporting Slab'] = cee_base['First_Route_Asg'].apply(get_cee_slab)
+        
+        st.markdown("**Reporting Slab Distribution (CEE Count)**")
+        slab_mode = st.radio("View Slab Summary By:", ["City", "Store"], horizontal=True)
+        
+        slab_pivot = cee_base.pivot_table(
+            index='city_name' if slab_mode == "City" else 'sa_name',
+            columns='Reporting Slab',
+            values='cee_id',
+            aggfunc='nunique',
+            fill_value=0
+        ).reset_index()
+        
+        # Ensure standard slab columns exist
+        slab_cols_order = ['On-Time Start', '> 04:30 AM', '> 05:00 AM', '> 05:30 AM', '> 06:00 AM']
+        for col in slab_cols_order:
+            if col not in slab_pivot.columns: slab_pivot[col] = 0
+            
+        slab_pivot['Total CEEs'] = slab_pivot[slab_cols_order].sum(axis=1)
+        st.dataframe(slab_pivot[[slab_pivot.columns[0]] + slab_cols_order + ['Total CEEs']], width='stretch')
+
+        st.divider()
+
+        # 3. Trip Distribution & Detailed Table
+        st.markdown("**Trip Distribution**")
+        trip_dist = cee_base['Trips'].value_counts().sort_index().reset_index()
+        trip_dist.columns = ['Trips Completed', 'No. of CEEs']
+        st.dataframe(trip_dist, width='stretch')
+        
+        st.markdown("**Detailed CEE List**")
         cee_base['Late Rate %'] = (cee_base['Late'] / cee_base['Orders'] * 100).round(1)
-        cee_cols = ['cee_name', 'sa_name', 'Trips', 'Orders', 'Societies', 'First route assignment', 'Last route assignment', 'First route delivery time', 'Last route route delivery time', 'Reporting Slab', 'Late Rate %']
-        st.dataframe(cee_base[cee_cols].sort_values('Trips', ascending=False), width='stretch')
+        cee_base['First assignment'] = cee_base['First_Route_Asg'].dt.strftime('%H:%M')
+        cee_base['Last delivery'] = cee_base['Last_Route_Del'].dt.strftime('%H:%M')
+        
+        st.dataframe(cee_base[['cee_name', 'sa_name', 'Trips', 'Orders', 'Societies', 'First assignment', 'Last delivery', 'Reporting Slab', 'Late Rate %']].sort_values('Trips', ascending=False), width='stretch')
 
     with tab6: # Society Analysis
         soc_view = df_act.groupby(['society_id', 'sa_name']).agg(Orders=('order_id', 'count'), Routes=('route_id', 'nunique'), CEEs=('cee_id', 'nunique'), Late=('Late', 'sum')).reset_index()
