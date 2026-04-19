@@ -141,24 +141,45 @@ if uploaded_file:
         st_data['Primary_RCA'] = st_data['Primary_RCA'].fillna("On Track")
         st.dataframe(st_data[['sa_name', 'Total_Orders', 'Actionable_Orders', 'On_Time_Orders', 'Late %', 'Primary_RCA', 'Avg Bin Wait']].sort_values('Late %', ascending=False), width='stretch')
 
-    with tab4: # ROUTE ANALYSIS (Updated with Stats)
+    with tab4: # ROUTE ANALYSIS (Updated with Weight Stats)
         st.subheader(f"Route Level Performance: {selected_city}")
         
+        # Check if weight column exists (using 'total_weight' as default)
+        weight_col = 'total_weight' if 'total_weight' in df_act.columns else None
+        
         # Base Route Data
-        rt_view = df_act.groupby(['route_id', 'sa_name']).agg(
-            Orders=('order_id', 'count'), 
-            Late=('Late', 'sum'), 
-            Societies=('society_id', 'nunique'), 
-            Avg_Wait=('Effective_Wait_Mins', 'mean'), 
-            Travel=('Travel_Mins', 'mean')
-        ).reset_index()
+        rt_agg = {
+            'order_id': 'count', 
+            'Late': 'sum', 
+            'society_id': 'nunique', 
+            'Effective_Wait_Mins': 'mean', 
+            'Travel_Mins': 'mean'
+        }
+        if weight_col:
+            rt_agg[weight_col] = 'sum'
+
+        rt_view = df_act.groupby(['route_id', 'sa_name']).agg(**{
+            'Orders': ('order_id', 'count'),
+            'Late': ('Late', 'sum'),
+            'Societies': ('society_id', 'nunique'),
+            'Avg_Wait': ('Effective_Wait_Mins', 'mean'),
+            'Travel': ('Travel_Mins', 'mean'),
+            'Total_Weight': (weight_col if weight_col else 'order_id', 'sum' if weight_col else 'count')
+        }).reset_index()
 
         # 1. Summary Statistics for Routes
         st.markdown("**Route Productivity Stats**")
-        rs1, rs2, rs3 = st.columns(3)
+        rs1, rs2 = st.columns(2)
+        rs3, rs4 = st.columns(2)
+        
         rs1.write(f"📏 **Orders per Route:** Min: {int(rt_view['Orders'].min())} | Max: {int(rt_view['Orders'].max())} | Avg: {int(rt_view['Orders'].mean())}")
         rs2.write(f"🏘️ **Societies per Route:** Min: {int(rt_view['Societies'].min())} | Max: {int(rt_view['Societies'].max())} | Avg: {rt_view['Societies'].mean():.1f}")
         rs3.write(f"⏱️ **Avg Travel per Route:** {int(rt_view['Travel'].mean())}m")
+        
+        if weight_col:
+            rs4.write(f"⚖️ **Weight per Route:** Min: {rt_view['Total_Weight'].min():.1f}kg | Max: {rt_view['Total_Weight'].max():.1f}kg | Avg: {rt_view['Total_Weight'].mean():.1f}kg")
+        else:
+            rs4.info("Weight column not found in CSV.")
         
         st.divider()
 
@@ -166,8 +187,9 @@ if uploaded_file:
         rt_view['Late Rate'] = (rt_view['Late'] / rt_view['Orders'] * 100).round(0).astype(int).astype(str) + '%'
         rt_view['Avg Bin Wait'] = rt_view['Avg_Wait'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
         rt_view['Avg Travel'] = rt_view['Travel'].apply(lambda x: f"{int(x)}m" if x > 0 else "-")
+        rt_view['Weight'] = rt_view['Total_Weight'].apply(lambda x: f"{x:.1f}kg")
         
-        st.dataframe(rt_view[['route_id', 'sa_name', 'Orders', 'Late Rate', 'Societies', 'Avg Bin Wait', 'Avg Travel']].sort_values('Orders', ascending=False), width='stretch')
+        st.dataframe(rt_view[['route_id', 'sa_name', 'Orders', 'Weight', 'Late Rate', 'Societies', 'Avg Bin Wait', 'Avg Travel']].sort_values('Orders', ascending=False), width='stretch')
 
     with tab5: # CEE Performance
         st.subheader(f"CEE Trip Distribution Summary: {selected_city}")
