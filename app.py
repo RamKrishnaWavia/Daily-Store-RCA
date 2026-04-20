@@ -6,31 +6,45 @@ import datetime
 st.set_page_config(page_title="Personal Command Center", layout="wide")
 st.title("🚚 Daily Delivery & RCA Command Center")
 
-uploaded_file = st.sidebar.file_uploader("Upload Delivery Report (CSV)", type="csv")
+# Updated type to allow both csv and xlsx
+uploaded_files = st.sidebar.file_uploader(
+    "Upload Delivery Report(s)", 
+    type=["csv", "xlsx"], 
+    accept_multiple_files=True
+)
 
-if uploaded_file:
-    # --- LOAD DATA ---
-    df = pd.read_csv(uploaded_file)
+if uploaded_files:
+    # --- LOAD & MERGE DATA ---
+    df_list = []
+    for file in uploaded_files:
+        if file.name.endswith('.csv'):
+            temp_df = pd.read_csv(file)
+        else:
+            # For Excel files (.xlsx)
+            temp_df = pd.read_excel(file)
+        df_list.append(temp_df)
     
-    # --- ROBUST DATE PARSING ---
+    df = pd.concat(df_list, ignore_index=True)
+    
+    # --- DATE PARSING (Strictly DD-MM-YYYY) ---
     time_cols = ['slot_from_time', 'order_binned_time', 'assignment_to_Cee_time', 'order_delivered_time']
     for col in time_cols:
         if col in df.columns:
-            # dayfirst=True ensures DD-MM-YYYY format is correctly prioritized
+            # dayfirst=True ensures April 19th (19-04) is read correctly
             df[col] = pd.to_datetime(df[col], dayfirst=True, errors='coerce')
 
-    # Extract clean date for the filters
+    # Extract date for filters
     df['delivery_date'] = df['slot_from_time'].dt.date
     available_dates = sorted(df['delivery_date'].dropna().unique())
     
     if not available_dates:
-        st.error("No valid dates found in 'slot_from_time'. Check your file format.")
+        st.error("No valid dates found in data. Check 'slot_from_time' column.")
         st.stop()
         
     f_min, f_max = available_dates[0], available_dates[-1]
 
-    # --- 2. GLOBAL FILTERS ---
-    st.sidebar.subheader("📅 Data Filters")
+    # --- 2. FILTERS (Auto-synced to your file dates) ---
+    st.sidebar.subheader("📅 Global Filters")
     start_dt = st.sidebar.date_input("Start Date", f_min)
     end_dt = st.sidebar.date_input("End Date", f_max)
     
@@ -43,10 +57,10 @@ if uploaded_file:
         df_f = df_f[df_f['city_name'] == sel_city]
 
     if df_f.empty:
-        st.warning(f"No records found for the selected criteria.")
+        st.warning(f"No records found for the selection.")
         st.stop()
 
-    # --- 3. STATUS & OPERATIONAL LOGIC ---
+    # --- 3. STATUS & TIMING LOGIC ---
     def get_live_status(row):
         s = str(row['order_status']).strip().lower()
         if s in ['cancelled', 'payment_pending']: return 'Cancelled'
@@ -56,92 +70,69 @@ if uploaded_file:
         return 'Bin'
 
     df_f['Live_Status'] = df_f.apply(get_live_status, axis=1)
-    # Actionable dataset: Excludes Cancelled/Payment Pending
     df_act = df_f[df_f['Live_Status'] != 'Cancelled'].copy()
 
-    # Constants & Timing
+    # Constants
     OTD_LIMIT, PICK_LIMIT = datetime.time(7, 0), datetime.time(4, 0)
 
+    # Core Calculations
     df_act['four_am'] = pd.to_datetime(df_act['delivery_date'].astype(str) + ' 04:00:00')
     df_act['wait_start'] = df_act[['order_binned_time', 'four_am']].max(axis=1)
     
-    # Eff_Wait: Time between Assignment and (Max of 4 AM or Binning)
     df_act['Eff_Wait'] = (df_act['assignment_to_Cee_time'] - df_act['wait_start']).dt.total_seconds() / 60
-    # Travel_Mins: Time from Assignment to Delivery
     df_act['Travel_Mins'] = (df_act['order_delivered_time'] - df_act['assignment_to_Cee_time']).dt.total_seconds() / 60
 
-    # DC Arrival Logic (Store-wide Check: >50% binned post 4 AM)
+    # DC Arrival Logic (Store-wide Check)
     dc_check = df_act.groupby(['delivery_date', 'sa_name'])['order_binned_time'].apply(
         lambda x: (x.dt.time > PICK_LIMIT).mean() > 0.5
     ).reset_index().rename(columns={'order_binned_time': 'is_dc_late'})
     df_act = df_act.merge(dc_check, on=['delivery_date', 'sa_name'], how='left')
 
-    # Flag SLA Breach (> 7 AM)
+    # SLA Breach Flag (> 7 AM)
     df_act['SLA_Breach'] = df_act['order_delivered_time'].apply(lambda x: x.time() > OTD_LIMIT if pd.notnull(x) else False)
     
-    # --- 4. REFINED RCA ENGINE ---
-    def get_rca(row):
+    # --- 4. RCA ENGINE ---
+    def calculate_rca(row):
         if not row['SLA_Breach']: return "On-time"
         
-        # 1. CEE Unavailable: Binned but no assignment time recorded
         if pd.notnull(row['order_binned_time']) and pd.isnull(row['assignment_to_Cee_time']):
             return "CEE Unavailable"
         
-        # 2. CEE Late Reporting: (Asg Time - max(Bin, 4 AM)) > 30 minutes
         if row['Eff_Wait'] > 30:
             return "CEE Late Reporting"
         
-        # 3. DC Arrival Issue: Late supply from DC to store (>50% late binning)
         if row['is_dc_late']:
             return "DC Arrival Issue"
         
-        # 4. GRN / Picking Delay: Specific order binned after 4 AM (internal store delay)
         if row['order_binned_time'].time() > PICK_LIMIT:
             return "GRN / Picking Delay"
         
-        # 5. CEE Took More Time: Travel/Delivery took more than 2 hours
         if row['Travel_Mins'] > 120:
             return "CEE Took More Time"
             
         return "Operational Delay"
 
-    df_act['Primary_RCA'] = df_act.apply(get_rca, axis=1)
+    df_act['Primary_RCA'] = df_act.apply(calculate_rca, axis=1)
 
-    # --- 5. DASHBOARD TABS ---
+    # --- 5. TABS WITH FULL SUMMARIES ---
     t_sla, t_city, t_rt, t_cee, t_soc, t_od = st.tabs([
         "OTD 7 AM SLA Breached RCA", "City Summary", "Route Analysis", "CEE Performance", "Society Load", "Audit Log"
     ])
 
-    with t_sla: # NEW BREACH DIVE-IN TAB
+    with t_sla:
         st.subheader("📉 OTD 7 AM SLA Breach Analysis")
-        breached_df = df_act[df_act['SLA_Breach'] == True]
-        
-        # Summary Metrics
+        breached = df_act[df_act['SLA_Breach']]
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Breached Orders", f"{len(breached_df):,}")
-        m2.metric("SLA Success Rate", f"{( (1 - len(breached_df)/len(df_act)) * 100):.1f}%")
-        m3.metric("Stores with Breaches", breached_df['sa_name'].nunique())
+        m1.metric("Total Breached Orders", f"{len(breached):,}")
+        m2.metric("SLA Success Rate", f"{( (1 - len(breached)/len(df_act)) * 100):.1f}%")
+        m3.metric("Stores with Breaches", breached['sa_name'].nunique())
         
         st.divider()
-        
-        # Impact Table
-        st.markdown("#### Root Cause Contribution (Impact Table)")
-        impact = breached_df.groupby(['city_name', 'Primary_RCA']).agg(
-            Orders_Impacted=('order_id', 'count'),
-            Routes_Impacted=('route_id', 'nunique'),
-            Stores_Impacted=('sa_name', 'nunique')
-        ).reset_index()
-        st.table(impact.sort_values(['city_name', 'Orders_Impacted'], ascending=[True, False]))
-        
-        st.divider()
-        
-        # Store Drill-down
-        st.markdown("#### Store-wise RCA Breakdown")
-        store_pivot = breached_df.pivot_table(index='sa_name', columns='Primary_RCA', values='order_id', aggfunc='count', fill_value=0)
-        st.dataframe(store_pivot, width='stretch')
+        impact = breached.groupby(['city_name', 'Primary_RCA']).agg(Orders=('order_id', 'count'), Routes=('route_id', 'nunique')).reset_index()
+        st.table(impact.sort_values(['city_name', 'Orders'], ascending=[True, False]))
 
     with t_city:
-        st.subheader("City Status Pivot")
+        st.subheader("City Status Snapshot")
         city_pivot = df_f.pivot_table(index='city_name', columns='Live_Status', values='order_id', aggfunc='count', fill_value=0).reset_index()
         st.dataframe(city_pivot, width='stretch')
 
@@ -157,19 +148,24 @@ if uploaded_file:
     with t_cee:
         st.subheader("CEE Efficiency")
         cee_v = df_act.groupby(['sa_name', 'cee_name']).agg(Trips=('route_id', 'nunique'), Orders=('order_id', 'count')).reset_index()
+        ce1, ce2 = st.columns(2)
+        ce1.metric("Active CEEs", len(cee_v))
+        ce2.metric("Multi-Tripping Rate", f"{((cee_v['Trips']>1).mean()*100):.1f}%")
         st.dataframe(cee_v.sort_values('Trips', ascending=False), width='stretch')
 
     with t_soc:
-        st.subheader("Society Load vs. Impact")
+        st.subheader("Society Load Analysis (All Orders)")
         soc_v = df_act.groupby(['society_id', 'sa_name']).agg(Total_Orders=('order_id', 'count'), Impacted_Orders=('SLA_Breach', 'sum')).reset_index()
         so1, so2 = st.columns(2)
-        so1.metric("Avg Orders/Society", int(soc_v['Total_Orders'].mean()))
-        so2.metric("Impact Rate (%)", f"{(soc_v['Impacted_Orders'].sum()/soc_v['Total_Orders'].sum() * 100):.1f}%")
+        so1.metric("Avg Load / Society", int(soc_v['Total_Orders'].mean()))
+        so2.metric("Total Societies Handled", len(soc_v))
+        soc_v['Impact %'] = (soc_v['Impacted_Orders'] / soc_v['Total_Orders'] * 100).round(1)
         st.dataframe(soc_v.sort_values('Total_Orders', ascending=False), width='stretch')
 
     with t_od:
-        st.subheader("Audit Detail Log")
+        st.subheader("Detailed Audit Log")
+        st.write(f"🔍 Actionable Orders Processed: {len(df_act)}")
         st.dataframe(df_act[['order_id', 'sa_name', 'cee_name', 'Primary_RCA', 'Live_Status']], width='stretch')
 
 else:
-    st.info("Please upload the CSV to begin. The dashboard will automatically filter for April 19th if that is the date in your file.")
+    st.info("Please upload your CSV or XLSX file(s) to begin.")
