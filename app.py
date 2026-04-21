@@ -24,7 +24,7 @@ if uploaded_files:
     
     df = pd.concat(df_list, ignore_index=True)
     
-    # --- DATE PARSING (DD-MM-YYYY) ---
+    # --- DATE PARSING (Strictly DD-MM-YYYY) ---
     time_cols = ['slot_from_time', 'order_binned_time', 'assignment_to_Cee_time', 'order_delivered_time']
     for col in time_cols:
         if col in df.columns:
@@ -77,28 +77,28 @@ if uploaded_files:
     df_act['Eff_Wait'] = (df_act['assignment_to_Cee_time'] - df_act['wait_start']).dt.total_seconds() / 60
     df_act['Travel_Mins'] = (df_act['order_delivered_time'] - df_act['assignment_to_Cee_time']).dt.total_seconds() / 60
 
-    # Breach Flag: Delivered after 7 AM OR Still Open/Not Delivered
+    # Breach Flag
     df_act['Is_Late'] = (df_act['order_delivered_time'].dt.time > OTD_LIMIT) | (df_act['order_delivered_time'].isna())
     
-    # --- 4. REFINED RCA ENGINE ---
+    # --- 4. THE CLEANED RCA ENGINE ---
     def calculate_rca(row):
         if not row['Is_Late']: return "On-time"
         
-        # 1. CEE Unavailable: Status is binned AND route_id is blank/0
-        is_binned_status = str(row['order_status']).strip().lower() == 'binned'
-        no_route = pd.isna(row['route_id']) or row['route_id'] == 0 or str(row['route_id']).strip() == ''
-        if is_binned_status and no_route:
+        # 1. CEE Unavailable: Binned status but blank Route ID
+        status_val = str(row['order_status']).strip().lower()
+        route_val = str(row['route_id']).strip().lower()
+        if status_val == 'binned' and (route_val == '' or route_val == '0' or route_val == 'nan'):
             return "CEE Unavailable"
         
-        # 2. Late GRN/Picking: Order binned after 4 AM
+        # 2. Late GRN/Picking: ANY order binned after 4:00 AM
         if pd.notnull(row['order_binned_time']) and row['order_binned_time'].time() > PICK_LIMIT:
             return "Late GRN/Picking"
         
-        # 3. CEE Late Reporting: Rider assigned > 30 mins after ready
+        # 3. CEE Late Reporting: Assignment > 30 mins after ready (or after 4AM)
         if row['Eff_Wait'] > 30:
             return "CEE Late Reporting"
         
-        # 4. CEE Took More Time: Travel > 2 hours
+        # 4. CEE Took More Time: Travel > 120 mins
         if pd.notnull(row['Travel_Mins']) and row['Travel_Mins'] > 120:
             return "CEE Took More Time"
             
@@ -106,7 +106,7 @@ if uploaded_files:
 
     df_act['Primary_RCA'] = df_act.apply(calculate_rca, axis=1)
 
-    # --- 5. DASHBOARD TABS ---
+    # --- 5. TABS ---
     t_sla, t_city, t_rt, t_cee, t_soc, t_od = st.tabs([
         "OTD 7 AM SLA Breached RCA", "City Summary", "Route Analysis", "CEE Performance", "Society Load", "Audit Log"
     ])
