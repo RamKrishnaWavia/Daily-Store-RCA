@@ -25,9 +25,11 @@ def load_and_process_data(files):
         else:
             temp = pd.read_excel(file)
         
-        # Downcasting to save RAM for Streamlit Cloud
+        # --- FIXED MEMORY DOWNCASTING ---
         for col in temp.select_dtypes(include=['float', 'int']).columns:
-            temp[col] = pd.to_numeric(temp[col], downcast='small')
+            # 'float' tells pandas to find the smallest possible numeric size (like float32)
+            temp[col] = pd.to_numeric(temp[col], downcast='float')
+            
         df_list.append(temp)
     
     df = pd.concat(df_list, ignore_index=True)
@@ -71,25 +73,22 @@ if uploaded_files:
         st.warning("No records found for this selection.")
         st.stop()
 
-    # --- 4. VECTORIZED RCA CALCULATIONS (High Performance) ---
+    # --- 4. VECTORIZED RCA CALCULATIONS ---
     OTD_LIMIT, PICK_LIMIT = datetime.time(7, 0), datetime.time(4, 0)
     
-    # Pre-calculate timing
     df_f['four_am'] = pd.to_datetime(df_f['delivery_date'].astype(str) + ' 04:00:00')
     df_f['wait_start'] = np.maximum(df_f['order_binned_time'], df_f['four_am'])
     df_f['Eff_Wait'] = (df_f['assignment_to_Cee_time'] - df_f['wait_start']).dt.total_seconds() / 60
     df_f['Travel_Mins'] = (df_f['order_delivered_time'] - df_f['assignment_to_Cee_time']).dt.total_seconds() / 60
     
-    # SLA Breach Flag (Delivered after 7 AM or Not Delivered)
     df_f['Is_Late'] = (df_f['order_delivered_time'].dt.time > OTD_LIMIT) | (df_f['order_delivered_time'].isna())
 
-    # Build RCA Hierarchy
     conds = [
-        (~df_f['Is_Late']),                                                  # On-time
-        (df_f['order_status'].str.lower() == 'binned') & (df_f['route_id'].isna() | (df_f['route_id'] == 0)), # CEE Unavailable
-        (df_f['order_binned_time'].dt.time > PICK_LIMIT),                    # Late GRN/Picking
-        (df_f['Eff_Wait'] > 30),                                             # CEE Late Reporting
-        (df_f['Travel_Mins'] > 80)                                           # CEE Took More Time (80m)
+        (~df_f['Is_Late']),
+        (df_f['order_status'].str.lower() == 'binned') & (df_f['route_id'].isna() | (df_f['route_id'] == 0)),
+        (df_f['order_binned_time'].dt.time > PICK_LIMIT),
+        (df_f['Eff_Wait'] > 30),
+        (df_f['Travel_Mins'] > 80)
     ]
     labels = ["On-time", "CEE Unavailable", "Late GRN/Picking", "CEE Late Reporting", "CEE Took More Time"]
     df_f['Primary_RCA'] = np.select(conds, labels, default="Operational Delay")
@@ -130,7 +129,6 @@ if uploaded_files:
             file_name=f"rca_audit_{sel_city}_{start_dt}.csv",
             mime='text/csv'
         )
-        # Prevents browser hanging by showing 1000 rows only
         st.dataframe(df_f[['order_id', 'sa_name', 'Primary_RCA', 'order_status', 'order_delivered_time']].head(1000), use_container_width=True)
 
 else:
